@@ -1,0 +1,25 @@
+[project]
+name = "code-review-bot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.95.0",
+    "asyncio>=4.0.0",
+    "python-dotenv>=1.2.2",
+    "structlog>=25.5.0",
+]
+
+[dependency-groups]
+dev = [
+    "commitizen>=4.13.10",
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_scheme = "pep440"
+version_provider = "uv"
+update_changelog_on_bump = true
+major_version_zero = true
