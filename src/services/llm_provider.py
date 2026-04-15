@@ -3,7 +3,8 @@
 import asyncio
 from dataclasses import dataclass
 
-from src.config.settings import settings
+from system.logs import logger
+from config.settings import settings
 from agent.prompts import load_system_prompt
 from anthropic import AsyncAnthropic, DefaultAioHttpClient
 
