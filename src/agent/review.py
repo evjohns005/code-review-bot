@@ -24,7 +24,6 @@ class LangGraphAgent:
         return Command(update={"chunks": chunks}, goto="review")
 
     async def _review_node(self, state: ReviewState) -> Command:
-        # loop over chunks, call llm_service.call() for each
         reviews = []
         for chunk in state.chunks:
             formatted_chunk = format_for_prompt(chunk)
