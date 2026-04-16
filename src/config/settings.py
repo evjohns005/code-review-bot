@@ -16,5 +16,7 @@ class Settings:
         self.MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2000"))
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
 
+        # Github
+        self.GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 settings = Settings()
