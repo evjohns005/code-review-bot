@@ -1,0 +1,465 @@
+C:\Users\evjoh>gh pr diff 665 --repo github.com/abhigyanpatwari/GitNexus
+diff --git a/gitnexus/src/core/ingestion/call-processor.py b/gitnexus/src/core/ingestion/call-processor.py
+index d0d5f2a5a..dc615be1c 100644
+--- a/gitnexus/src/core/ingestion/call-processor.py
++++ b/gitnexus/src/core/ingestion/call-processor.py
+@@ -1670,6 +1670,33 @@ const resolveFieldOwnership = (
+   return ctx.symbols.lookupFieldByOwner(classDef.nodeId, fieldName) ?? undefined;
+ };
+
++/**
++ * Resolve a method by owner type name using the eagerly-populated methodByOwner index.
++ * Returns the SymbolDefinition if an unambiguous method is found, undefined otherwise.
++ * Falls through to undefined for: unknown type, no class-like candidates, ambiguous overloads.
++ */
++const resolveMethodByOwner = (
++  receiverTypeName: string,
++  methodName: string,
++  filePath: string,
++  ctx: ResolutionContext,
++): SymbolDefinition | undefined => {
++  const typeResolved = ctx.resolve(receiverTypeName, filePath);
++  if (!typeResolved) return undefined;
++  const classDef = typeResolved.candidates.find(
++    (d) =>
++      d.type === 'Class' ||
++      d.type === 'Struct' ||
++      d.type === 'Interface' ||
++      d.type === 'Enum' ||
++      d.type === 'Record' ||
++      d.type === 'Impl',
++  );
++  if (!classDef) return undefined;
++
++  return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
++};
++
+ /**
+  * Create a deduplicated ACCESSES edge emitter for a single source node.
+  * Each (sourceId, fieldNodeId) pair is emitted at most once per source.
+@@ -1730,6 +1757,19 @@ const walkMixedChain = (
+         currentType = fieldResolved.typeName;
+         continue;
+       }
++      // Fast path: O(1) owner-scoped method lookup via methodByOwner index.
++      // Avoids fuzzy lookup when the owner type is known and the method is unambiguous.
++      // Note: CALLS edges for intermediate chain steps are NOT emitted here — walkMixedChain
++      // only threads types. CALLS edges come from the outer per-call-expression loop in processCalls.
++      const methodDef = resolveMethodByOwner(currentType, step.name, filePath, ctx);
++      if (methodDef?.returnType) {
++        const fastRetType = extractReturnTypeName(methodDef.returnType);
++        if (fastRetType) {
++          currentType = fastRetType;
++          continue;
++        }
++      }
++      // Fallback: fuzzy resolution via resolveCallTarget (cross-file, inherited, etc.)
+       const resolved = resolveCallTarget(
+         { calledName: step.name, callForm: 'member', receiverTypeName: currentType },
+         filePath,
+diff --git a/gitnexus/src/core/ingestion/symbol-table.ts b/gitnexus/src/core/ingestion/symbol-table.ts
+index 3b292823b..b007948c3 100644
+--- a/gitnexus/src/core/ingestion/symbol-table.ts
++++ b/gitnexus/src/core/ingestion/symbol-table.ts
+@@ -79,6 +79,15 @@ export interface SymbolTable {
+    */
+   lookupFieldByOwner: (ownerNodeId: string, fieldName: string) => SymbolDefinition | undefined;
+
++  /**
++   * Look up a method by its owning class nodeId and method name.
++   * O(1) via dedicated eagerly-populated index keyed by `ownerNodeId\0methodName`.
++   * For overloaded methods (same owner + name): returns the first match when all
++   * overloads share the same returnType, undefined when return types differ (ambiguous).
++   * Used by walkMixedChain for deterministic cross-class chain resolution.
++   */
++  lookupMethodByOwner: (ownerNodeId: string, methodName: string) => SymbolDefinition | undefined;
++
+   /**
+    * Debugging: See how many symbols are tracked
+    */
+@@ -109,6 +118,10 @@ export const createSymbolTable = (): SymbolTable => {
+   // Only Property symbols with ownerId and declaredType are indexed.
+   const fieldByOwner = new Map<string, SymbolDefinition>();
+
++  // 5. Eagerly-populated Method Index — keyed by "ownerNodeId\0methodName".
++  // Method symbols with ownerId are indexed. Supports overloads (array values).
++  const methodByOwner = new Map<string, SymbolDefinition[]>();
++
+   const CALLABLE_TYPES = new Set(['Function', 'Method', 'Constructor']);
+
+   const add = (
+@@ -170,6 +183,17 @@ export const createSymbolTable = (): SymbolTable => {
+     }
+     globalIndex.get(name)!.push(def);
+
++    // C2. Methods with ownerId go to methodByOwner index (in addition to globalIndex).
++    if (type === 'Method' && metadata?.ownerId) {
++      const key = `${metadata.ownerId}\0${name}`;
++      const existing = methodByOwner.get(key);
++      if (existing) {
++        existing.push(def);
++      } else {
++        methodByOwner.set(key, [def]);
++      }
++    }
++
+     // D. Invalidate the lazy callable index only when adding callable types
+     if (CALLABLE_TYPES.has(type)) {
+       callableIndex = null;
+@@ -213,6 +237,23 @@ export const createSymbolTable = (): SymbolTable => {
+     return fieldByOwner.get(`${ownerNodeId}\0${fieldName}`);
+   };
+
++  const lookupMethodByOwner = (
++    ownerNodeId: string,
++    methodName: string,
++  ): SymbolDefinition | undefined => {
++    const defs = methodByOwner.get(`${ownerNodeId}\0${methodName}`);
++    if (!defs || defs.length === 0) return undefined;
++    if (defs.length === 1) return defs[0];
++    // Multiple overloads: return first if all share the same defined returnType (safe for chain resolution).
++    // Return undefined if return types differ or are absent (truly ambiguous — can't determine which overload).
++    const firstReturnType = defs[0].returnType;
++    if (firstReturnType === undefined) return undefined;
++    for (let i = 1; i < defs.length; i++) {
++      if (defs[i].returnType !== firstReturnType) return undefined;
++    }
++    return defs[0];
++  };
++
+   const getStats = () => ({
+     fileCount: fileIndex.size,
+     globalSymbolCount: globalIndex.size,
+@@ -223,6 +264,7 @@ export const createSymbolTable = (): SymbolTable => {
+     globalIndex.clear();
+     callableIndex = null;
+     fieldByOwner.clear();
++    methodByOwner.clear();
+   };
+
+   return {
+@@ -233,6 +275,7 @@ export const createSymbolTable = (): SymbolTable => {
+     lookupFuzzy,
+     lookupFuzzyCallable,
+     lookupFieldByOwner,
++    lookupMethodByOwner,
+     getStats,
+     clear,
+   };
+diff --git a/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/Address.java b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/Address.java
+new file mode 100644
+index 000000000..ed34bf9f7
+--- /dev/null
++++ b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/Address.java
+@@ -0,0 +1,10 @@
++public class Address {
++    private City city;
++
++    public City getCity() {
++        return city;
++    }
++
++    public void save() {
++    }
++}
+diff --git a/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/App.java b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/App.java
+new file mode 100644
+index 000000000..e7737bc3c
+--- /dev/null
++++ b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/App.java
+@@ -0,0 +1,16 @@
++public class App {
++    // Two-step pure method chain: user.getAddress().save()
++    public static void twoStepChain(User user) {
++        user.getAddress().save();
++    }
++
++    // Three-step pure method chain: user.getAddress().getCity().getZipCode()
++    public static void threeStepChain(User user) {
++        user.getAddress().getCity().getZipCode();
++    }
++
++    // Mixed chain: method then field then method: user.getAddress().city.getZipCode()
++    public static void mixedChain(User user) {
++        user.getAddress().city.getZipCode();
++    }
++}
+diff --git a/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/City.java b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/City.java
+new file mode 100644
+index 000000000..5e6aee23e
+--- /dev/null
++++ b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/City.java
+@@ -0,0 +1,5 @@
++public class City {
++    public String getZipCode() {
++        return "12345";
++    }
++}
+diff --git a/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/User.java b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/User.java
+new file mode 100644
+index 000000000..4db370f6e
+--- /dev/null
++++ b/gitnexus/test/fixtures/lang-resolution/java-method-chain-cross-class/User.java
+@@ -0,0 +1,11 @@
++public class User {
++    private Address address;
++
++    public Address getAddress() {
++        return address;
++    }
++
++    public String getName() {
++        return "Alice";
++    }
++}
+diff --git a/gitnexus/test/integration/resolvers/java.test.ts b/gitnexus/test/integration/resolvers/java.test.ts
+index 1b7217031..d03dd1bbd 100644
+--- a/gitnexus/test/integration/resolvers/java.test.ts
++++ b/gitnexus/test/integration/resolvers/java.test.ts
+@@ -2015,3 +2015,69 @@ describe('Java same-arity overloads via sequential path (skipWorkers)', () => {
+     }
+   });
+ });
++
++// ---------------------------------------------------------------------------
++// Cross-class pure method chain resolution via lookupMethodByOwner (#575)
++// ---------------------------------------------------------------------------
++
++describe('Cross-class method chain resolution (Java) — #575', () => {
++  let result: PipelineResult;
++
++  beforeAll(async () => {
++    result = await runPipelineFromRepo(
++      path.join(FIXTURES, 'java-method-chain-cross-class'),
++      () => {},
++    );
++  }, 60000);
++
++  it('detects classes: Address, App, City, User', () => {
++    expect(getNodesByLabel(result, 'Class')).toEqual(['Address', 'App', 'City', 'User']);
++  });
++
++  it('two-step chain: user.getAddress().save() → Address#save', () => {
++    const calls = getRelationships(result, 'CALLS');
++    const saveCalls = calls.filter((e) => e.target === 'save' && e.source === 'twoStepChain');
++    expect(saveCalls.length).toBe(1);
++    expect(saveCalls[0].targetFilePath).toContain('Address');
++  });
++
++  it('two-step chain: user.getAddress().save() also emits CALLS to User#getAddress', () => {
++    const calls = getRelationships(result, 'CALLS');
++    const getAddressCalls = calls.filter(
++      (e) => e.target === 'getAddress' && e.source === 'twoStepChain',
++    );
++    expect(getAddressCalls.length).toBe(1);
++    expect(getAddressCalls[0].targetFilePath).toContain('User');
++  });
++
++  it('three-step chain: user.getAddress().getCity().getZipCode() → City#getZipCode', () => {
++    const calls = getRelationships(result, 'CALLS');
++    const zipCalls = calls.filter(
++      (e) => e.target === 'getZipCode' && e.source === 'threeStepChain',
++    );
++    expect(zipCalls.length).toBe(1);
++    expect(zipCalls[0].targetFilePath).toContain('City');
++  });
++
++  it('three-step chain emits CALLS for all intermediate steps', () => {
++    const calls = getRelationships(result, 'CALLS');
++    const threeStepCalls = calls.filter((e) => e.source === 'threeStepChain');
++    const targets = threeStepCalls.map((e) => e.target).sort();
++    expect(targets).toContain('getAddress');
++    expect(targets).toContain('getCity');
++    expect(targets).toContain('getZipCode');
++  });
++
++  it('mixed chain: user.getAddress().city.getZipCode() → City#getZipCode', () => {
++    const calls = getRelationships(result, 'CALLS');
++    const zipCalls = calls.filter((e) => e.target === 'getZipCode' && e.source === 'mixedChain');
++    expect(zipCalls.length).toBe(1);
++    expect(zipCalls[0].targetFilePath).toContain('City');
++  });
++
++  it('mixed chain emits ACCESSES edge for field step: .city on Address', () => {
++    const accesses = getRelationships(result, 'ACCESSES');
++    const cityAccess = accesses.filter((e) => e.target === 'city' && e.source === 'mixedChain');
++    expect(cityAccess.length).toBe(1);
++  });
++});
+diff --git a/gitnexus/test/unit/symbol-table.test.ts b/gitnexus/test/unit/symbol-table.test.ts
+index 4e06e06fb..e01548277 100644
+--- a/gitnexus/test/unit/symbol-table.test.ts
++++ b/gitnexus/test/unit/symbol-table.test.ts
+@@ -287,6 +287,147 @@ describe('SymbolTable', () => {
+     });
+   });
+
++  describe('lookupMethodByOwner', () => {
++    it('finds a Method by ownerNodeId and method name', () => {
++      table.add('src/models.ts', 'getAddress', 'method:getAddress', 'Method', {
++        returnType: 'Address',
++        ownerId: 'class:User',
++      });
++      const def = table.lookupMethodByOwner('class:User', 'getAddress');
++      expect(def).toBeDefined();
++      expect(def!.returnType).toBe('Address');
++      expect(def!.nodeId).toBe('method:getAddress');
++    });
++
++    it('finds multiple methods on the same owner', () => {
++      table.add('src/models.ts', 'getAddress', 'method:getAddress', 'Method', {
++        returnType: 'Address',
++        ownerId: 'class:User',
++      });
++      table.add('src/models.ts', 'getName', 'method:getName', 'Method', {
++        returnType: 'String',
++        ownerId: 'class:User',
++      });
++      expect(table.lookupMethodByOwner('class:User', 'getAddress')!.returnType).toBe('Address');
++      expect(table.lookupMethodByOwner('class:User', 'getName')!.returnType).toBe('String');
++    });
++
++    it('distinguishes methods by owner', () => {
++      table.add('src/models.ts', 'save', 'method:user:save', 'Method', {
++        returnType: 'boolean',
++        ownerId: 'class:User',
++      });
++      table.add('src/models.ts', 'save', 'method:address:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:Address',
++      });
++      expect(table.lookupMethodByOwner('class:User', 'save')!.nodeId).toBe('method:user:save');
++      expect(table.lookupMethodByOwner('class:Address', 'save')!.nodeId).toBe(
++        'method:address:save',
++      );
++    });
++
++    it('returns undefined for unknown owner', () => {
++      table.add('src/models.ts', 'save', 'method:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:User',
++      });
++      expect(table.lookupMethodByOwner('class:Unknown', 'save')).toBeUndefined();
++    });
++
++    it('returns undefined for unknown method name', () => {
++      table.add('src/models.ts', 'save', 'method:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:User',
++      });
++      expect(table.lookupMethodByOwner('class:User', 'delete')).toBeUndefined();
++    });
++
++    it('returns undefined for empty table', () => {
++      expect(table.lookupMethodByOwner('class:User', 'save')).toBeUndefined();
++    });
++
++    it('does NOT index Method without ownerId', () => {
++      table.add('src/utils.ts', 'helper', 'method:helper', 'Method');
++      expect(table.lookupMethodByOwner('', 'helper')).toBeUndefined();
++      // But it should still be in lookupFuzzy
++      expect(table.lookupFuzzy('helper')).toHaveLength(1);
++    });
++
++    it('returns first match for overloads with same returnType (unambiguous)', () => {
++      table.add('src/models.ts', 'find', 'method:find:1', 'Method', {
++        parameterCount: 1,
++        returnType: 'User',
++        ownerId: 'class:UserRepo',
++      });
++      table.add('src/models.ts', 'find', 'method:find:2', 'Method', {
++        parameterCount: 2,
++        returnType: 'User',
++        ownerId: 'class:UserRepo',
++      });
++      const def = table.lookupMethodByOwner('class:UserRepo', 'find');
++      expect(def).toBeDefined();
++      expect(def!.nodeId).toBe('method:find:1');
++      expect(def!.returnType).toBe('User');
++    });
++
++    it('returns undefined for overloads both missing returnType (ambiguous)', () => {
++      table.add('src/models.ts', 'process', 'method:process:1', 'Method', {
++        parameterCount: 1,
++        ownerId: 'class:Handler',
++      });
++      table.add('src/models.ts', 'process', 'method:process:2', 'Method', {
++        parameterCount: 2,
++        ownerId: 'class:Handler',
++      });
++      expect(table.lookupMethodByOwner('class:Handler', 'process')).toBeUndefined();
++    });
++
++    it('does NOT index Constructor in methodByOwner', () => {
++      table.add('src/models.ts', 'User', 'ctor:User', 'Constructor', {
++        parameterCount: 0,
++        ownerId: 'class:User',
++      });
++      expect(table.lookupMethodByOwner('class:User', 'User')).toBeUndefined();
++      // But it should be in lookupFuzzyCallable
++      expect(table.lookupFuzzyCallable('User')).toHaveLength(1);
++    });
++
++    it('returns undefined for overloads with different returnTypes (ambiguous)', () => {
++      table.add('src/models.ts', 'convert', 'method:convert:1', 'Method', {
++        parameterCount: 1,
++        returnType: 'String',
++        ownerId: 'class:Converter',
++      });
++      table.add('src/models.ts', 'convert', 'method:convert:2', 'Method', {
++        parameterCount: 2,
++        returnType: 'Number',
++        ownerId: 'class:Converter',
++      });
++      expect(table.lookupMethodByOwner('class:Converter', 'convert')).toBeUndefined();
++    });
++
++    it('Method with ownerId is still available via lookupFuzzy and lookupFuzzyCallable', () => {
++      table.add('src/models.ts', 'save', 'method:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:User',
++      });
++      // Methods stay in globalIndex (unlike Properties)
++      expect(table.lookupFuzzy('save')).toHaveLength(1);
++      expect(table.lookupFuzzyCallable('save')).toHaveLength(1);
++    });
++
++    it('after clear(), lookupMethodByOwner returns undefined', () => {
++      table.add('src/models.ts', 'save', 'method:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:User',
++      });
++      expect(table.lookupMethodByOwner('class:User', 'save')).toBeDefined();
++      table.clear();
++      expect(table.lookupMethodByOwner('class:User', 'save')).toBeUndefined();
++    });
++  });
++
+   describe('lookupFuzzyCallable', () => {
+     it('returns only callable types (Function, Method, Constructor)', () => {
+       table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+@@ -324,18 +465,23 @@ describe('SymbolTable', () => {
+   });
+
+   describe('clear', () => {
+-    it('resets all state including fieldByOwner', () => {
++    it('resets all state including fieldByOwner and methodByOwner', () => {
+       table.add('src/a.ts', 'foo', 'func:foo', 'Function');
+       table.add('src/b.ts', 'bar', 'func:bar', 'Function');
+       table.add('src/models.ts', 'address', 'prop:address', 'Property', {
+         declaredType: 'Address',
+         ownerId: 'class:User',
+       });
++      table.add('src/models.ts', 'save', 'method:save', 'Method', {
++        returnType: 'void',
++        ownerId: 'class:User',
++      });
+       table.clear();
+       expect(table.getStats()).toEqual({ fileCount: 0, globalSymbolCount: 0 });
+       expect(table.lookupExact('src/a.ts', 'foo')).toBeUndefined();
+       expect(table.lookupFuzzy('foo')).toEqual([]);
+       expect(table.lookupFieldByOwner('class:User', 'address')).toBeUndefined();
++      expect(table.lookupMethodByOwner('class:User', 'save')).toBeUndefined();
+       expect(table.lookupFuzzyCallable('foo')).toEqual([]);
+     });
+

@@ -6,19 +6,14 @@ from dataclasses import dataclass
 from system.logs import logger
 from config.settings import settings
 from agent.prompts import load_system_prompt
-from anthropic import AsyncAnthropic, DefaultAioHttpClient
+from anthropic import AsyncAnthropic
 
 _client: AsyncAnthropic | None = None
 
 def get_anthropic_client(api_key: str) -> AsyncAnthropic:
     global _client
     if _client is None:
-        # Optional performance enhancement with http_client
-        _client = AsyncAnthropic(
-            api_key=api_key,
-            http_client=DefaultAioHttpClient(),
-        )
-
+        _client = AsyncAnthropic(api_key=api_key)
     return _client
 
 

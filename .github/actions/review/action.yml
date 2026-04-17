@@ -1,0 +1,48 @@
+name: 'AI Code Review Bot'
+description: >
+  Automated PR code reviews powered by Claude AI.
+  Reviews diffs, surfaces bugs/security issues, and posts a comment — then exits.
+author: 'evjohns005'
+
+branding:
+  icon: 'code'
+  color: 'purple'
+
+inputs:
+  github-token:
+    description: 'GitHub token with pull-requests: write permission (use secrets.GITHUB_TOKEN)'
+    required: true
+  anthropic-api-key:
+    description: 'Anthropic API key for Claude model access'
+    required: true
+  model:
+    description: 'Claude model ID to use for reviews'
+    required: false
+    default: 'claude-sonnet-4-5'
+  max-tokens:
+    description: 'Maximum tokens per LLM response'
+    required: false
+    default: '2000'
+  pr-number:
+    description: 'PR number to review. Auto-detected from the pull_request event if omitted.'
+    required: false
+  langsmith-api-key:
+    description: 'LangSmith API key for tracing and observability (optional)'
+    required: false
+  langsmith-project:
+    description: 'LangSmith project name'
+    required: false
+    default: 'code-review-bot'
+
+runs:
+  using: 'docker'
+  image: 'docker://ghcr.io/evjohns005/code-review-bot:latest'
+  env:
+    GITHUB_TOKEN: ${{ inputs.github-token }}
+    ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+    DEFAULT_LLM_MODEL: ${{ inputs.model }}
+    MAX_TOKENS: ${{ inputs.max-tokens }}
+    INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+    LANGCHAIN_API_KEY: ${{ inputs.langsmith-api-key }}
+    LANGCHAIN_PROJECT: ${{ inputs.langsmith-project }}
+    LANGCHAIN_TRACING_V2: ${{ inputs.langsmith-api-key != '' && 'true' || 'false' }}

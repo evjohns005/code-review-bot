@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 
-from src.config.settings import settings
+from config.settings import settings
 
 def load_system_prompt(**kwargs):
     """Load the system prompt from the file."""
